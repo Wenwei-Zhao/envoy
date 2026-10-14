@@ -32,11 +32,13 @@ scenario with more tools, which also shows `server/discover`, cache hints and a 
 request through Envoy.
 
 Both run on the host with `run.sh`, or in containers with Docker Compose and the official Envoy
-image, with nothing to install but Docker: see [Run with Docker Compose](#run-with-docker-compose).
+image, with nothing to install but Docker, or rootless Podman, and Docker Compose: see
+[Run with Docker Compose](#run-with-docker-compose).
 
 ## Prerequisites
 
-For [Docker Compose](#run-with-docker-compose), only Docker, with Compose v2. For `run.sh`:
+For [Docker Compose](#run-with-docker-compose), only Docker, or rootless Podman, with Compose v2.
+For `run.sh`:
 - Linux, `bash` and `curl`.
 - Python 3.10 or newer, with the MCP Python SDK at exactly version 2.2.0, `mcp==2.2.0`, which the
   suite is pinned to: `run.sh` runs both the client and the server with that SDK. Before it builds
@@ -110,8 +112,74 @@ still running 5 seconds later.
 ## Run with Docker Compose
 
 [`compose.yaml`](compose.yaml) runs the same tests in three containers, with the official Envoy
-image. It needs only Docker, with Compose v2: no virtualenv, no MCP SDK and no Envoy build. From
-this directory:
+image. It needs only Docker Compose v2 and a container engine, Docker or rootless Podman: no
+virtualenv, no MCP SDK and no Envoy build. On a Cloudtop, start with the quick start below.
+
+### Cloudtop Quick Start (Rootless Podman)
+
+For a Cloudtop where rootless Podman and Docker Compose v2 are already set up.
+
+**1. Configure Docker Compose to use rootless Podman**
+
+```sh
+systemctl --user start podman.socket
+export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/podman/podman.sock"
+export DOCKER_BUILDKIT=0
+```
+
+**2. Enter the E2E directory**
+
+```sh
+cd ~/git/envoy/test/extensions/filters/http/mcp/e2e  # adjust to your checkout
+```
+
+**3. Run the regression suite (17 cases)**
+
+```sh
+docker compose up --build \
+  --abort-on-container-exit \
+  --exit-code-from mcp-client
+```
+
+**4. Run the developer demo**
+
+```sh
+DEMO=1 docker compose up --build \
+  --abort-on-container-exit \
+  --exit-code-from mcp-client
+```
+
+**5. View logs and clean up**
+
+```sh
+docker compose logs mcp-client
+docker compose logs envoy
+docker compose logs mcp-server
+docker compose down
+```
+
+Notes:
+- **Runtime:** Docker Compose uses Podman as the container runtime, through Podman's
+  Docker-compatible API socket (`DOCKER_HOST`); no Docker daemon runs. `docker` can be Podman's
+  `podman-docker` wrapper; without one, run `docker-compose` in place of `docker compose`.
+- **Builds:** Podman's API has no BuildKit, so `DOCKER_BUILDKIT=0` makes Compose v2 build with its
+  classic builder, after a warning that Bake needs BuildKit. Compose v5 has no classic builder.
+- **New terminals:** set `DOCKER_HOST` and `DOCKER_BUILDKIT` again, as in step 1, in every new
+  terminal session.
+- **One-time setup:** installing Podman and Docker Compose v2, and giving your user a subordinate
+  UID/GID range (`/etc/subuid`, `/etc/subgid`), are done once, not for each run.
+- **Two modes:** the regression suite and the [developer demo](#developer-demo-demo1) are separate
+  runs. `DEMO=1` runs the demo in place of the 17 cases.
+- **Results:** `docker compose down` keeps the `run` volume, which holds the run's files. Do not
+  use `docker compose down -v` unless you mean to delete those stored results.
+  `podman volume inspect mcp-e2e_run` shows where they are.
+- **Verification:** only a run that passes inside the containers verifies this setup:
+  `docker compose up` exits 0, after `PASS` for all 17 cases, or for all of the demo's checks.
+  Images that build and containers that start are not enough.
+
+### General instructions
+
+From this directory:
 
 ```sh
 # The 17 regression cases.
@@ -151,11 +219,8 @@ latest image. The client then warns that Envoy is not the verified revision. The
 `/bin/sh`, `sed` and its own `/docker-entrypoint.sh`, as the Ubuntu-based variants have, and the
 distroless ones do not.
 
-To move the pin:
-1. Choose an image whose Envoy revision contains the MCP changes that the suite tests.
-2. Check that revision in its binary.
-3. Run both modes with `ENVOY_IMAGE`.
-4. Update the digest and `VERIFIED_ENVOY_REVISION` in `compose.yaml`.
+To move the pin when the cases come to rely on newer MCP changes, see
+[Updating the pinned image](#updating-the-pinned-image).
 
 **Logs and results.** The three services share a run directory, `/e2e-run`: a Docker volume, or a
 host directory with `RUN_DIR` set. It has:
@@ -199,6 +264,67 @@ How the containers differ from `run.sh`. None of these changes a check:
 - **SELinux:** on hosts that enforce SELinux, such as Fedora, the containers may need the `z`
   option to read the bind-mounted directories: `.:/e2e:ro,z` in `compose.yaml`, and the same for
   a `RUN_DIR`.
+
+### Updating the pinned image
+
+When the cases come to rely on newly merged MCP changes, move the pin by hand to a newer official
+development image. The image reference in `compose.yaml` and `VERIFIED_ENVOY_REVISION` name the
+same commit: change them together. Run the commands from this directory, with Docker, or after
+step 1 of the [Cloudtop Quick Start](#cloudtop-quick-start-rootless-podman).
+
+**1. Choose a commit.** Pick a `dev-<commit>` tag of `envoyproxy/envoy` on Docker Hub, of the plain
+variant, not `distroless-` or `contrib-`, whose commit has those changes. Main's CI publishes these
+tags. The moving `dev` tag can lag behind them, and some commits get no image.
+
+```sh
+COMMIT=<the tag's 40-character commit>
+```
+
+**2. Check that it contains the MCP changes that the cases rely on:** those of
+envoyproxy/envoy#47280, #47862 and #47915, and any newer one. In your checkout:
+
+```sh
+git fetch upstream main  # your envoyproxy/envoy remote
+for c in 462a53dfe63b215829060f43aac215c5f57808c8 a887bcc47fad0d451d5b9c658b629c12800982ea \
+    eb32f1f93e91d651129470c44811ad908ba7bb41; do
+  git merge-base --is-ancestor "$c" "$COMMIT" && echo "ok      $c" || echo "MISSING $c"
+done
+```
+
+**3. Look up its digest, and check the revision of its binary.** The digest is the image index's,
+for amd64 and arm64. The image's metadata does not record its commit, so the check runs Envoy. The
+`docker run` reference has the digest only, which Podman needs.
+
+```sh
+TAGS=https://hub.docker.com/v2/namespaces/envoyproxy/repositories/envoy/tags
+DIGEST=$(curl -s "${TAGS}/dev-${COMMIT}" \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])')
+docker run --rm --entrypoint envoy "envoyproxy/envoy@${DIGEST}" --version
+```
+
+The version must start with the commit, and say `Clean`.
+
+**4. Run both modes against it**, before you change the pin:
+
+```sh
+export ENVOY_IMAGE="envoyproxy/envoy:dev-${COMMIT}@${DIGEST}"
+docker compose up --build --abort-on-container-exit --exit-code-from mcp-client
+DEMO=1 docker compose up --build --abort-on-container-exit --exit-code-from mcp-client
+unset ENVOY_IMAGE
+```
+
+The client's first line names the new revision, with a warning that it is not yet the verified
+one. Both runs must end with `PASS`: 17 of 17 cases, and all of the demo's checks.
+
+**5. Move the pin, in one change.** Replace the old commit and digest everywhere that they appear,
+which `grep -rn` finds, and update the text about them:
+- `compose.yaml`: the `ENVOY_IMAGE` default, `VERIFIED_ENVOY_REVISION`, and the comment above the
+  image;
+- this README: the `envoy` row of the services table, and **The Envoy image** above: the commit,
+  the MCP changes that it has, and how it was verified.
+
+Then run both modes again, without `ENVOY_IMAGE`: no warning, and `PASS`. If the cases now rely on
+a newer MCP change, add it to [Prerequisites](#prerequisites) and to step 2.
 
 ## Files
 
